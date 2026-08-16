@@ -14,7 +14,12 @@ vlc -I dummy --play-and-exit --sout-keep \
 
 ## Install
 
-Copy `merge_playlist.lua` into VLC's extensions directory and restart VLC:
+Inside VLC: **Tools → Plugins and extensions → Add-ons**, find *Merge Playlist
+into one File*, press Install, restart VLC. This is the route intended for
+everyone; it needs no files, no downloads and no folder paths.
+
+For development, or if the add-on is not listed yet, copy `merge_playlist.lua`
+into VLC's extensions directory by hand and restart:
 
 | OS      | Path                                                             |
 |---------|------------------------------------------------------------------|
@@ -22,7 +27,7 @@ Copy `merge_playlist.lua` into VLC's extensions directory and restart VLC:
 | Windows | `%APPDATA%\vlc\lua\extensions\`                                  |
 | macOS   | `~/Library/Application Support/org.videolan.vlc/lua/extensions/`  |
 
-Then: **View → Merge Playlist into one File**
+Either way it then appears under **View → Merge Playlist into one File**.
 
 ## Use
 
@@ -69,14 +74,27 @@ and `addons.videolan.org` is the shop front for it — a Pling/openDesktop store
 the same platform as `store.kde.org`. Publishing means registering there and
 adding a product under VLC's extension category with the `.vlp` attached.
 
-Temper expectations: the repository currently carries 104 skins and **five**
-extensions, one of which is VLSub, which already ships with VLC. It is a working
-delivery channel, not a busy marketplace, so a release download will reach more
-people than a listing will.
+The add-on manager is the *only* channel the intended audience will use: they
+are not expected to know what GitHub is, let alone how to place a file in a
+hidden application directory. This repository exists for transparency, not for
+distribution. Two consequences worth keeping in mind:
 
-`manifest.xml` carries the add-on's permanent `id`. Never regenerate it —
-that UUID is the identity the add-on manager uses to recognise updates to an
-already-installed add-on.
+- **The manifest is user-facing copy.** Its `<name>`, `<summary>` and
+  `<description>` are what people read in VLC's Add-ons list, so they are
+  written without playlist, container or codec jargon.
+- **A bad package installs silently and then misbehaves**, with no way for the
+  user to diagnose or undo it. `package.sh` therefore refuses to build unless
+  the manifest and the extension agree on the version, every declared
+  `<resource>` exists, and the Lua parses.
+
+`manifest.xml` carries the add-on's permanent `id`. Never regenerate it — that
+UUID is the identity the add-on manager uses to recognise updates to an
+already-installed copy. A new id would install a second, duplicate add-on
+alongside the old one rather than upgrading it.
+
+For context on how much traffic to expect: the repository currently carries 104
+skins and **five** extensions, one of which is VLSub, which already ships with
+VLC. It is a working delivery channel rather than a busy marketplace.
 
 ## Diagnosing
 

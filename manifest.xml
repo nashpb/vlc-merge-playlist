@@ -1,10 +1,26 @@
 <?xml version="1.0" encoding="utf-8"?>
+<!--
+  The add-on manifest. package.sh embeds icon.png into a copy of this file at
+  build time, so the <image> element is absent here on purpose.
+
+  The id is permanent: the add-on manager uses it to recognise updates to an
+  already-installed copy. Never regenerate it.
+
+  The wording below is what people read in VLC's Add-ons list, so it avoids
+  playlist/container jargon and says what they get.
+-->
 <videolan xmlns="http://videolan.org/ns/vlc/addons/1.0">
   <addons>
-    <addon type="extension" id="f6369532-04c7-487a-b2fa-bba9989cb593" version="0.2">
+    <addon type="extension" id="f6369532-04c7-487a-b2fa-bba9989cb593" version="1.0">
       <name>Merge Playlist into one File</name>
-      <summary>Joins every track of a playlist into a single M4A file, keeping each track's start and stop times.</summary>
-      <description><![CDATA[Concatenates the tracks of a playlist into one M4A audio file, honouring the per-track start-time/stop-time set through #EXTVLCOPT. Open a playlist, then View > Merge Playlist into one File. Roughly one minute of work per hour of audio.]]></description>
+      <summary>Combine all the tracks of a playlist into a single audio file.</summary>
+      <description><![CDATA[Turns a playlist into one continuous audio file, which is far easier to copy onto a phone, a car stereo or an MP3 player than a folder full of separate tracks.
+
+If your playlist trims tracks so they start or stop part-way through, those trims are kept.
+
+To use it: open your playlist in VLC, then choose View, then Merge Playlist into one File. Check where the file will be saved, choose the sound quality and press Convert. It takes roughly one minute for every hour of audio, and VLC cannot play anything else while it works.
+
+The result is saved as an .m4a file, which plays on phones, computers and most car stereos.]]></description>
       <authorship>
         <creator>Ahmad Amireh</creator>
         <email>ahmad@amireh.net</email>

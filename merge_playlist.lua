@@ -663,7 +663,7 @@ end
 function descriptor()
     return {
         title = "Merge Playlist into one File",
-        version = "0.2",
+        version = "1.0",
         author = "",
         shortdesc = "Merge Playlist into one File",
         description = "Joins every track of a playlist into a single M4A audio "
