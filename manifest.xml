@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<videolan xmlns="http://videolan.org/ns/vlc/addons/1.0">
+  <addons>
+    <addon type="extension" id="f6369532-04c7-487a-b2fa-bba9989cb593" version="0.2">
+      <name>Merge Playlist into one File</name>
+      <summary>Joins every track of a playlist into a single M4A file, keeping each track's start and stop times.</summary>
+      <description><![CDATA[Concatenates the tracks of a playlist into one M4A audio file, honouring the per-track start-time/stop-time set through #EXTVLCOPT. Open a playlist, then View > Merge Playlist into one File. Roughly one minute of work per hour of audio.]]></description>
+      <authorship>
+        <creator>Ahmad Amireh</creator>
+        <email>ahmad@amireh.net</email>
+        <sourceurl/>
+      </authorship>
+      <resource type="extension">merge_playlist.lua</resource>
+    </addon>
+  </addons>
+</videolan>

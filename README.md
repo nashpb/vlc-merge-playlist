@@ -57,6 +57,27 @@ everything after the first track.
 - **The output carries no tags.** VLC's stream output cannot write metadata.
 - **VLC 3.x only.** VLC 4 rewrote the Lua playlist API.
 
+## Packaging and publishing
+
+`./package.sh` builds `dist/merge-playlist.vlp` — the format VLC's own add-on
+manager installs. It is a plain zip holding `manifest.xml` at the root next to
+the files that manifest lists as `<resource>`, matching the packages served by
+`api-addons.videolan.org`.
+
+VLC's **Tools → Plugins and extensions → Add-ons** tab reads that repository,
+and `addons.videolan.org` is the shop front for it — a Pling/openDesktop store,
+the same platform as `store.kde.org`. Publishing means registering there and
+adding a product under VLC's extension category with the `.vlp` attached.
+
+Temper expectations: the repository currently carries 104 skins and **five**
+extensions, one of which is VLSub, which already ships with VLC. It is a working
+delivery channel, not a busy marketplace, so a release download will reach more
+people than a listing will.
+
+`manifest.xml` carries the add-on's permanent `id`. Never regenerate it —
+that UUID is the identity the add-on manager uses to recognise updates to an
+already-installed add-on.
+
 ## Diagnosing
 
 VLC swallows extension errors: the dialog simply stops reacting and nothing is

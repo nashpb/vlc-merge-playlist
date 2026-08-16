@@ -1,2 +1,5 @@
 # byproduct of `luac -p` syntax checks
 luac.out
+
+# built by package.sh
+dist/
