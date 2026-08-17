@@ -36,17 +36,31 @@ local START_TIMEOUT = 10    -- seconds to wait for playback to begin
 local POLL = 0.25
 local BAR_WIDTH = 28
 
---- Where the diagnostic trace goes. Extension errors are otherwise invisible,
---- so this file is the only way to find out what happened. /tmp does not exist
---- on Windows, so ask VLC where its cache lives.
-local TRACE_PATH = (function()
-    local separator = (package and package.config and package.config:sub(1, 1)) or "/"
-    local ok, dir = pcall(vlc.config.cachedir)
+--- Where the diagnostic trace goes, resolved on first use.
+---
+--- This must NOT be computed at load time. When VLC loads the script to read
+--- its descriptor, vlc.config does not necessarily exist yet, and a top-level
+--- call that throws stops the extension loading at all -- whereupon it simply
+--- disappears from the View menu with no error anywhere. Nothing at the top
+--- level of this file may touch the vlc table.
+local trace_path = nil
+
+local function resolve_trace_path()
+    if trace_path then return trace_path end
+
+    trace_path = "/tmp/merge_playlist.log"
+    -- /tmp does not exist on Windows, so prefer VLC's own cache directory.
+    local ok, dir = pcall(function()
+        if vlc and vlc.config and vlc.config.cachedir then
+            return vlc.config.cachedir()
+        end
+    end)
     if ok and dir and dir ~= "" then
-        return dir .. separator .. "merge_playlist.log"
+        local separator = (package and package.config and package.config:sub(1, 1)) or "/"
+        trace_path = dir .. separator .. "merge_playlist.log"
     end
-    return "/tmp/merge_playlist.log"
-end)()
+    return trace_path
+end
 
 --=============================================================================
 -- state
@@ -67,7 +81,7 @@ local job = nil        -- the merge in flight
 local function log(msg)
     vlc.msg.info("[merge_playlist] " .. tostring(msg))
     pcall(function()
-        local f = io.open(TRACE_PATH, "a")
+        local f = io.open(resolve_trace_path(), "a")
         if f then
             f:write(tostring(msg) .. "\n")
             f:close()
@@ -274,7 +288,7 @@ local function guarded(name, fn)
             log("!! " .. name .. " failed: " .. tostring(err))
             pcall(show_result, "Something went wrong",
                   "<b>" .. name .. "</b> failed:<br><br>" .. tostring(err)
-               .. "<br><br>A copy of this is in " .. TRACE_PATH)
+               .. "<br><br>A copy of this is in " .. resolve_trace_path())
         end
     end
 end

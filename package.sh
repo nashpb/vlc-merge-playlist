@@ -40,6 +40,14 @@ else
     echo "note: luac5.2 not found, skipping the syntax check" >&2
 fi
 
+# ...and it has to survive being loaded before the vlc API is fully present,
+# or it vanishes from the View menu without a word. See test_load.lua.
+if command -v lua5.2 >/dev/null 2>&1; then
+    lua5.2 test_load.lua || exit 1
+else
+    echo "note: lua5.2 not found, skipping the load test" >&2
+fi
+
 rm -rf dist
 mkdir -p dist
 

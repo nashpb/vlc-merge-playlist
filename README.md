@@ -145,6 +145,27 @@ anything.
 - Dropdowns return the first added value by default regardless of what they
   appear to show, so the recommended default has to be listed first.
 
+**Loading**
+
+- Nothing at the top level of the script may touch the `vlc` table. VLC loads
+  the script to read `descriptor()` before the API is necessarily in place, and
+  a script that throws while loading does not fail loudly — it disappears from
+  the View menu with no message anywhere. `test_load.lua` proves the script
+  loads and describes itself against an empty `vlc` table, and `package.sh`
+  refuses to build if it does not.
+- `pcall(vlc.config.cachedir)` does **not** guard anything: the argument is
+  evaluated before `pcall` runs, so it throws if `vlc.config` is absent. Guard
+  with `pcall(function() ... end)` and check each field exists.
+
+**Menu placement cannot be changed**
+
+The fields VLC reads from `descriptor()` are `title`, `version`, `author`,
+`shortdesc`, `description`, `capabilities` and `menu`; the accepted capabilities
+are `input-listener`, `playing-listener`, `meta-listener` and `menu`. None of
+them affects placement, and `menu` only adds a submenu beneath the extension's
+own entry. The Qt interface appends extensions to the View menu in hardcoded
+C++, so *View* is the only possible location short of forking VLC.
+
 **The sandbox**
 
 The extension sandbox is not the interface sandbox. `vlc.misc` — the clock and
