@@ -4,26 +4,29 @@
   build time, so the <image> element is absent here on purpose.
 
   The id is permanent: the add-on manager uses it to recognise updates to an
-  already-installed copy. Never regenerate it.
+  already-installed copy. Never regenerate it. This is a different add-on from
+  the audio-only "Merge Playlist into one File", so it has an id of its own.
 
   The wording below is what people read in VLC's Add-ons list, so it avoids
-  playlist/container jargon and says what they get.
+  jargon and says what they get.
 -->
 <videolan xmlns="http://videolan.org/ns/vlc/addons/1.0">
   <addons>
-    <addon type="extension" id="f6369532-04c7-487a-b2fa-bba9989cb593" version="1.0">
-      <name>Merge Playlist into one File</name>
-      <summary>Combine all the tracks of a playlist into a single audio file.</summary>
-      <description><![CDATA[Turns a playlist into one continuous audio file, which is far easier to copy onto a phone, a car stereo or an MP3 player than a folder full of separate tracks.
+    <addon type="extension" id="07362698-c60b-4e3e-81db-cfa020528de4" version="2.0">
+      <name>Merge Playlist into one Video</name>
+      <summary>Combine the videos and pictures of a playlist into a single video file.</summary>
+      <description><![CDATA[Turns a playlist of videos, pictures and music into one continuous video file that is easy to copy onto a phone, a TV stick or a USB drive.
 
-If your playlist trims tracks so they start or stop part-way through, those trims are kept.
+Everything is joined in the order of the playlist. Pictures are shown for a few seconds each, videos of different shapes and sizes are fitted onto the same screen with black bars, and clips that have no sound stay silent. If your playlist trims a clip so it starts or stops part-way through, those trims are kept.
 
-To use it: open your playlist in VLC, then choose View, then Merge Playlist into one File. Check where the file will be saved, choose the sound quality and press Convert. It takes roughly one minute for every hour of audio, and VLC cannot play anything else while it works.
+This add-on needs the free program ffmpeg (ffmpeg.org) to be installed on your computer.
 
-The result is saved as an .m4a file, which plays on phones, computers and most car stereos.]]></description>
+To use it: open your playlist in VLC, then choose View, then Merge Playlist into one Video. Check where the file will be saved, choose the picture size and quality, and press Merge. You can keep using VLC while it works; press Refresh to see how far along it is.
+
+The result is saved as an .mp4 file, which plays on phones, computers and most TVs.]]></description>
       <authorship>
-        <creator>Ahmad Amireh</creator>
-        <email>ahmad@amireh.net</email>
+        <creator>Based on vlc-merge-playlist by Ahmad Amireh</creator>
+        <email/>
         <sourceurl/>
       </authorship>
       <resource type="extension">merge_playlist.lua</resource>

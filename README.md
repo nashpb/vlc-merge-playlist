@@ -1,179 +1,80 @@
-# Merge Playlist into one File
+# Merge Playlist into one Video
 
-A VLC 3.x Lua extension that joins every track of a playlist — honouring the
-per-track `start-time` / `stop-time` set through `#EXTVLCOPT` — into a single
-M4A file, from the GUI.
+A VLC 3.x Lua extension that joins every **video, image and audio file** of a playlist — in playlist order, honouring per-item `start-time` / `stop-time` / `image-duration` set through `#EXTVLCOPT` — into a single **MP4** file, from the GUI.
 
-It is the GUI counterpart to:
+It is the video counterpart of [vlc-merge-playlist](https://github.com/amireh/vlc-merge-playlist) (audio-only, by Ahmad Amireh), whose dialog code and VLC quirk notes it builds on.
 
-```sh
-vlc -I dummy --play-and-exit --sout-keep \
-  --sout '#transcode{acodec=mp4a,ab=128,channels=2,samplerate=48000}:gather:std{access=file,mux=mp4,dst=out.m4a}' \
-  playlist.m3u8
-```
+**Requires [ffmpeg](https://ffmpeg.org) to be installed.** VLC does the playlist and dialog; ffmpeg does the joining.
 
 ## Install
 
-Inside VLC: **Tools → Plugins and extensions → Add-ons**, find *Merge Playlist
-into one File*, press Install, restart VLC. This is the route intended for
-everyone; it needs no files, no downloads and no folder paths.
-
-For development, or if the add-on is not listed yet, copy `merge_playlist.lua`
-into VLC's extensions directory by hand and restart:
+Copy `merge_playlist.lua` into VLC's extensions directory and restart VLC:
 
 | OS      | Path                                                             |
 |---------|------------------------------------------------------------------|
 | Linux   | `~/.local/share/vlc/lua/extensions/`                             |
 | Windows | `%APPDATA%\vlc\lua\extensions\`                                  |
-| macOS   | `~/Library/Application Support/org.videolan.vlc/lua/extensions/`  |
+| macOS   | `~/Library/Application Support/org.videolan.vlc/lua/extensions/` |
 
-Either way it then appears under **View → Merge Playlist into one File**.
+It then appears under **View → Merge Playlist into one Video**. `./package.sh` also builds `dist/merge-playlist-video.vlp`, the format VLC's add-on manager installs.
 
 ## Use
 
-1. Open the playlist in VLC as usual.
-2. View → Merge Playlist into one File.
-3. Check the output path and quality, press **Convert**.
-4. Wait — roughly one minute per hour of audio. To abort, press **Cancel merge**.
+1. Open your playlist in VLC (or add the files to VLC's playlist).
+2. View → Merge Playlist into one Video.
+3. **To keep trims and per-item image durations**, type the path of the `.m3u8` file in *Playlist file*. VLC does not expose `#EXTVLCOPT` values of items already in its playlist, so without this the dialog merges the items in order with no trims.
+4. Check *Save as*, *Picture size*, *Quality*, *Seconds per image* and the *ffmpeg* path (found automatically if it is on your PATH or in a common install folder).
+5. Press **Merge**, then **Refresh** to see progress. VLC stays usable meanwhile.
 
-VLC cannot play anything else while it works.
+## What it does with each kind of item
 
-## Why M4A and not MP3
+| Item | Result |
+|---|---|
+| Video with sound | Kept, trimmed if `start-time` / `stop-time` are set |
+| Video without sound | Kept, with silence |
+| Different size, shape or frame rate | Scaled to fit the chosen size with black bars, converted to 30 fps; phone rotation is applied |
+| Image (jpg, png, bmp, webp, tif) | Shown for *Seconds per image*, or its own `image-duration`, with silence |
+| Audio file | Played over its embedded cover art, or black if it has none |
+| Animated GIF | Played once, silent |
+| Missing files, web URLs, `vlc://` items | Skipped, and listed in `merge_playlist.log` |
 
-VLC's stream output has no MP3 muxer — `mux=raw` writes a bare frame stream with
-no Xing header, no duration, and no tags, which makes players estimate the length
-and seek by guesswork. The MP4 muxer writes a real duration and seek index.
-Ogg and Opus were tested and rejected: `gather` and the Ogg muxer together drop
-everything after the first track.
+Output: H.264 + AAC (192 kbps) MP4, with the index at the front so it can start playing while it downloads.
+
+## How it works, and why ffmpeg
+
+Each item is first turned into a short intermediate clip with the same size, frame rate and audio format, **with picture and sound made exactly the same length** (rounded to a whole number of frames). The clips are then joined without re-encoding the picture, and only the audio is encoded to AAC at the end. Equal lengths matter: a few milliseconds of mismatch per clip adds up to visibly drifting sound over a long playlist.
+
+VLC's own stream output (`transcode` + `gather` + MP4 mux, which the audio-only version uses) was tried first with mixed videos and images and rejected:
+
+- With H.264 the MP4 muxer loses the boundary marker between items, producing a wrong edit list so the video plays short.
+- Trims are not sample-accurate under transcoding, and audio and picture lengths differ per file, so sync drifts further with each item.
+- Images and silent videos need a made-up audio track, and some audio formats failed to join silently.
+
+The extension writes a small shell script (`job.sh`, or `job.bat` on Windows) into VLC's cache folder (`…/merge_video_job`), starts it in the background, and reads its status files when you press Refresh (or whenever VLC raises a playback event). Nothing is changed in your source files.
 
 ## Known limitations
 
-- **Menu placement is fixed.** VLC 3's Qt interface builds its own menus and
-  lists every extension under *View*. Putting this next to *Media → Save Playlist
-  to File…* would require patching and shipping a forked VLC.
-- **Progress updates only as often as VLC raises playback events.** There is no
-  timer in the Lua API, so the merge is advanced by the input/playing/meta
-  listener callbacks. The extension thread must never block: while it is busy,
-  Qt cannot build or paint the dialog's widgets and the window renders blank.
-- **Aborting discards the output.** An interrupted MP4 never gets its `moov` atom
-  written and is unplayable, so the partial file is deleted.
-- **Stopping early and a failed track look identical** from inside the extension,
-  so the message covers both.
-- **The output carries no tags.** VLC's stream output cannot write metadata.
-- **VLC 3.x only.** VLC 4 rewrote the Lua playlist API.
+- **Progress is not live.** VLC's Lua API has no timer; press Refresh.
+- **Preparing can freeze the dialog briefly** on very long playlists: each file is inspected once before the job starts, and Qt cannot repaint while that runs.
+- **Cancel on Windows** stops after the current clip rather than instantly. On Linux/macOS it stops at once.
+- **Disk space:** intermediate clips are uncompressed-audio and high-quality video and are deleted at the end; allow a few times the final size while it runs.
+- Menu placement is fixed under *View* (VLC 3's Qt interface lists all extensions there). **VLC 3.x only**; VLC 4 rewrote the Lua playlist API.
+- Tags and chapters are not written.
 
-## Packaging and publishing
+## Tested
 
-`./package.sh` builds `dist/merge-playlist.vlp` — the format VLC's own add-on
-manager installs. It is a plain zip holding `manifest.xml` at the root next to
-the files that manifest lists as `<resource>`, matching the packages served by
-`api-addons.videolan.org`.
+Linux, VLC 3.0.20 (Qt) and ffmpeg 6.1: dialog opened from the View menu, merge run and finished from inside VLC, output checked with ffprobe (length matches the sum of the clips, picture and sound equal length, sound only where the source had it, every clip in the right place). The test set covered images, a trimmed video, a 4:3 video, a portrait video, a video without sound, an MP3 with cover art, a phone-rotated video, an animated GIF, and a filename containing `'` and `%`.
 
-VLC's **Tools → Plugins and extensions → Add-ons** tab reads that repository,
-and `addons.videolan.org` is the shop front for it — a Pling/openDesktop store,
-the same platform as `store.kde.org`. Publishing means registering there and
-adding a product under VLC's extension category with the `.vlp` attached.
-
-The add-on manager is the *only* channel the intended audience will use: they
-are not expected to know what GitHub is, let alone how to place a file in a
-hidden application directory. This repository exists for transparency, not for
-distribution. Two consequences worth keeping in mind:
-
-- **The manifest is user-facing copy.** Its `<name>`, `<summary>` and
-  `<description>` are what people read in VLC's Add-ons list, so they are
-  written without playlist, container or codec jargon.
-- **A bad package installs silently and then misbehaves**, with no way for the
-  user to diagnose or undo it. `package.sh` therefore refuses to build unless
-  the manifest and the extension agree on the version, every declared
-  `<resource>` exists, and the Lua parses.
-
-`manifest.xml` carries the add-on's permanent `id`. Never regenerate it — that
-UUID is the identity the add-on manager uses to recognise updates to an
-already-installed copy. A new id would install a second, duplicate add-on
-alongside the old one rather than upgrading it.
-
-For context on how much traffic to expect: the repository currently carries 104
-skins and **five** extensions, one of which is VLSub, which already ships with
-VLC. It is a working delivery channel rather than a busy marketplace.
-
-## Diagnosing
-
-VLC swallows extension errors: the dialog simply stops reacting and nothing is
-shown. Every step is therefore mirrored to `merge_playlist.log` in VLC's cache
-directory (`~/.cache/vlc/` on Linux), which is the first place to look.
+**Windows and macOS are untested.** The Windows launcher (`job.bat`, `start /B`) and the macOS ffmpeg search paths are written from documentation only; check the log (`merge_playlist.log` in VLC's cache folder) first if something does not start.
 
 ## Development notes
 
-`merge_playlist.lua` is deliberately written against a small, verified slice of
-the VLC 3 Lua API. Nearly every constraint below was found by a failure that
-gave no error message, so read the comments in the source before rearranging
-anything.
+- VLC's extension sandbox lacks some standard Lua functions (for example `rawget`); a script using one fails to load and **silently disappears from the View menu**. `test_load.lua` cannot catch that, so load the script in real VLC (run `vlc -vv` and look for `Error loading script`).
+- `test_load.lua` proves the script loads and describes itself against an empty `vlc` table; `package.sh` refuses to build if it fails, and also checks the manifest version, the declared resources and the Lua syntax.
+- A looped cover image needs `setpts=N/(fps*TB)` after `loop`, or ffmpeg never reaches the end of the clip.
+- Inherited from the audio version: never call `dlg:delete()` from a listener callback, keep deleted dialog handles alive forever, `widget:get_value()` returns two values, and the first dropdown entry is the default.
+- `manifest.xml` carries this add-on's permanent `id`; never regenerate it.
 
-**The conversion sequence**
+## Licence
 
-- Playback must start on the first **child** of the expanded playlist node, not
-  on the node itself, or track 1 is dropped with no error at all.
-- Starting requires `gotoitem(id)` *then* `play()`. Neither alone works.
-- A `vlc://nop` item must be played afterwards or the MP4 `moov` atom is never
-  written and the output is unplayable. `playlist.stop()` does not release a
-  kept stream output; nor does clearing `sout-keep`.
-- Track durations must be snapshotted **before** playback: a playing track
-  reports its source file's full length, not the trimmed segment.
-- Identify the current track by matching its URI against that snapshot. Counting
-  change events over-reports — transient inputs at startup each look like a new
-  track, and a track's name changes mid-play when its ID3 title replaces the
-  playlist's.
-- Always quote `dst=` in the sout chain. Unquoted, an apostrophe in the path
-  (`Al-Qur'an`) swallows the chain's closing brace and the file is written as
-  `out.m4a}`. Backslashes must be doubled — that is every separator on Windows.
-
-**The dialog**
-
-- Never block the extension thread. While it is busy Qt cannot build or paint
-  widgets, and the window renders as an empty rectangle. This is why the merge
-  is driven by listener callbacks rather than a loop.
-- Never call `dlg:delete()` from a listener callback: it deadlocks against the
-  Qt thread and VLC has to be killed. Only build dialogs from button handlers;
-  from a callback, restrict yourself to `set_text` and `update`.
-- A deleted dialog's handle must be retained forever. Once collected, its
-  finaliser throws `Can't get pointer to dialog` inside whatever unrelated
-  callback happened to trigger the collection.
-- The old dialog *must* be deleted before a new one will display. Hiding alone
-  leaves the next page invisible.
-- `widget:get_value()` returns **two** values, the id and its label, so
-  `tonumber(w:get_value())` passes the label as a numeric base.
-- Dropdowns return the first added value by default regardless of what they
-  appear to show, so the recommended default has to be listed first.
-
-**Loading**
-
-- Nothing at the top level of the script may touch the `vlc` table. VLC loads
-  the script to read `descriptor()` before the API is necessarily in place, and
-  a script that throws while loading does not fail loudly — it disappears from
-  the View menu with no message anywhere. `test_load.lua` proves the script
-  loads and describes itself against an empty `vlc` table, and `package.sh`
-  refuses to build if it does not.
-- `pcall(vlc.config.cachedir)` does **not** guard anything: the argument is
-  evaluated before `pcall` runs, so it throws if `vlc.config` is absent. Guard
-  with `pcall(function() ... end)` and check each field exists.
-
-**Menu placement cannot be changed**
-
-The fields VLC reads from `descriptor()` are `title`, `version`, `author`,
-`shortdesc`, `description`, `capabilities` and `menu`; the accepted capabilities
-are `input-listener`, `playing-listener`, `meta-listener` and `menu`. None of
-them affects placement, and `menu` only adds a submenu beneath the extension's
-own entry. The Qt interface appends extensions to the View menu in hardcoded
-C++, so *View* is the only possible location short of forking VLC.
-
-**The sandbox**
-
-The extension sandbox is not the interface sandbox. `vlc.misc` — the clock and
-the sleep — is absent from extensions though present in `--lua-intf` scripts, so
-a harness built on a Lua interface will happily pass code that cannot run. Strip
-`vlc.misc` and `vlc.object` in any test harness. `os.time()` works for wall
-clock; `os.clock()` does **not** (it is process CPU time and races ahead while
-transcoding threads run). Never bound a loop by the clock alone — with no clock
-it never exits and wedges VLC.
-
-Verified against VLC 3.0.23 (Lua 5.2) on Linux. Windows and macOS are untested.
+This is derived from vlc-merge-playlist, which does not state a licence in the repository. Check with the original author before publishing this elsewhere.

@@ -1,5 +1,5 @@
 #!/bin/sh
-# Build the VLC add-on package (dist/merge-playlist.vlp) for upload to
+# Build the VLC add-on package (dist/merge-playlist-video.vlp) for upload to
 # addons.videolan.org.
 #
 # A VLC add-on is a plain zip holding manifest.xml at the root alongside the
@@ -13,7 +13,7 @@ set -eu
 
 cd "$(dirname "$0")"
 
-out="dist/merge-playlist.vlp"
+out="dist/merge-playlist-video.vlp"
 
 # Keep the manifest's declared version and the extension's descriptor in step:
 # the add-ons manager shows the manifest's, the user sees the descriptor's.
@@ -72,7 +72,7 @@ if count != 1:
 open("dist/manifest.xml", "w", encoding="utf-8").write(manifest)
 EOF
 
-( cd dist && zip -q -X "merge-playlist.vlp" manifest.xml )
+( cd dist && zip -q -X "merge-playlist-video.vlp" manifest.xml )
 zip -q -X "$out" $resources
 rm -f dist/manifest.xml
 

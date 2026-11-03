@@ -1,129 +1,104 @@
 --[[
-  Merge Playlist into one File
-  A VLC 3.x Lua extension that concatenates every track of a playlist -- honouring
-  the per-track start-time/stop-time set via #EXTVLCOPT -- into a single M4A file.
+  Merge Playlist into one Video
+  A VLC 3.x Lua extension that joins every video, image and audio file of a
+  playlist -- in playlist order, honouring #EXTVLCOPT start-time / stop-time /
+  image-duration -- into a single MP4 file.
+
+  VLC's own stream output cannot do this reliably (see README), so the actual
+  joining is done by ffmpeg, which must be installed. The extension builds a
+  small script, starts it in the background and shows its progress.
 
   Install:
     Linux    ~/.local/share/vlc/lua/extensions/merge_playlist.lua
     Windows  %APPDATA%\vlc\lua\extensions\merge_playlist.lua
     macOS    ~/Library/Application Support/org.videolan.vlc/lua/extensions/merge_playlist.lua
 
-  Then: View -> Merge Playlist into one File
+  Then: View -> Merge Playlist into one Video
 
-  The merge is driven by VLC's listener callbacks rather than by a loop. That is
-  not a stylistic choice: while the extension thread is busy, Qt cannot build or
-  paint the dialog's widgets, so a polling loop leaves the user staring at an
-  empty window. Every callback must therefore return promptly.
+  Derived from vlc-merge-playlist (audio-only version) by Ahmad Amireh; the
+  dialog plumbing and the VLC quirks documented below come from that work.
 
-  Other behaviours worked around here fail silently -- see README.
+  Constraints inherited from VLC 3's Lua API (all fail silently):
+    * Nothing at the top level of this file may touch the `vlc` table.
+    * Never block the extension thread for long: Qt cannot paint while it is busy.
+    * Never call dlg:delete() from a listener callback; only from button handlers.
+    * widget:get_value() returns two values; wrap it in parentheses.
 ]]
 
 --=============================================================================
 -- configuration
 --=============================================================================
 
-local PLAYLIST_EXTS = {
-    m3u = true, m3u8 = true, xspf = true, pls = true, asx = true, wpl = true,
-}
+local PLAYLIST_EXTS = { m3u = true, m3u8 = true, xspf = true, pls = true, asx = true, wpl = true }
+local IMAGE_EXTS = { jpg = true, jpeg = true, jfif = true, png = true, bmp = true,
+                     webp = true, tif = true, tiff = true }
 
--- The first entry is what the dropdown shows and returns unless the user picks
+-- The first entry of each list is what a dropdown returns unless the user picks
 -- another, so the recommended default has to lead.
-local BITRATES = { "128", "192", "256", "96" }
-local DEFAULT_BITRATE = 128
-
-local EXPAND_TIMEOUT = 10   -- seconds to wait for the playlist to expand
-local START_TIMEOUT = 10    -- seconds to wait for playback to begin
-local POLL = 0.25
+local SIZES = {
+    { label = "1280 x 720  (HD)",        w = 1280, h = 720 },
+    { label = "1920 x 1080  (Full HD)",  w = 1920, h = 1080 },
+    { label = "854 x 480  (small file)", w = 854,  h = 480 },
+}
+local QUALITIES = {
+    { label = "Good  (recommended)", crf = 22 },
+    { label = "High  (bigger file)", crf = 18 },
+    { label = "Smaller file",        crf = 27 },
+}
+local FPS = 30
+local DEFAULT_IMAGE_SECONDS = 5
+local AUDIO_KBPS = 192
 local BAR_WIDTH = 28
 
---- Where the diagnostic trace goes, resolved on first use.
----
---- This must NOT be computed at load time. When VLC loads the script to read
---- its descriptor, vlc.config does not necessarily exist yet, and a top-level
---- call that throws stops the extension loading at all -- whereupon it simply
---- disappears from the View menu with no error anywhere. Nothing at the top
---- level of this file may touch the vlc table.
-local trace_path = nil
-
-local function resolve_trace_path()
-    if trace_path then return trace_path end
-
-    trace_path = "/tmp/merge_playlist.log"
-    -- /tmp does not exist on Windows, so prefer VLC's own cache directory.
-    local ok, dir = pcall(function()
-        if vlc and vlc.config and vlc.config.cachedir then
-            return vlc.config.cachedir()
-        end
-    end)
-    if ok and dir and dir ~= "" then
-        local separator = (package and package.config and package.config:sub(1, 1)) or "/"
-        trace_path = dir .. separator .. "merge_playlist.log"
-    end
-    return trace_path
-end
+local IS_WINDOWS = (package and package.config and package.config:sub(1, 1) == "\\") or false
+local SEP = IS_WINDOWS and "\\" or "/"
 
 --=============================================================================
 -- state
 --=============================================================================
 
 local dlg = nil
-local ui = {}          -- widgets of the current dialog page
-local sources = {}     -- playlist-file candidates found in the playlist
-local pending = nil    -- job awaiting overwrite confirmation
-local job = nil        -- the merge in flight
+local ui = {}
+local sources = {}
+local pending = nil     -- merge awaiting overwrite confirmation
+local job = nil         -- the merge in flight
+local trace_path = nil
+local retained_dialogs = {}
 
 --=============================================================================
 -- helpers
 --=============================================================================
 
--- Extension errors are invisible by default: VLC swallows them and the dialog
--- simply stops reacting. Mirror everything to a file as well as the log.
+--- Resolved on first use: vlc.config may not exist when VLC loads the script.
+local function resolve_trace_path()
+    if trace_path then return trace_path end
+    trace_path = IS_WINDOWS and "merge_playlist.log" or "/tmp/merge_playlist.log"
+    local ok, dir = pcall(function()
+        if vlc and vlc.config and vlc.config.cachedir then return vlc.config.cachedir() end
+    end)
+    if ok and dir and dir ~= "" then trace_path = dir .. SEP .. "merge_playlist.log" end
+    return trace_path
+end
+
 local function log(msg)
-    vlc.msg.info("[merge_playlist] " .. tostring(msg))
+    pcall(function() vlc.msg.info("[merge_playlist] " .. tostring(msg)) end)
     pcall(function()
         local f = io.open(resolve_trace_path(), "a")
-        if f then
-            f:write(tostring(msg) .. "\n")
-            f:close()
-        end
+        if f then f:write(tostring(msg) .. "\n"); f:close() end
     end)
 end
 
---- Wall-clock seconds. Deliberately not os.clock(), which is process CPU time
---- and races ahead of real time while the transcoding threads are busy.
-local function now()
-    if vlc.misc and vlc.misc.mdate then return vlc.misc.mdate() / 1000000 end
-    if os and os.time then return os.time() end
-    return nil
-end
+local function now() return os.time() end
 
---- vlc.misc, which owns the real sleep, is absent from the extension sandbox.
-local function sleep(seconds)
-    if vlc.misc and vlc.misc.mwait then
-        vlc.misc.mwait(vlc.misc.mdate() + seconds * 1000000)
-    elseif os and os.clock then
-        local deadline = os.clock() + seconds
-        while os.clock() < deadline do end
-    end
-end
-
-local function is_playing()
-    if vlc.input and vlc.input.is_playing then
-        local ok, playing = pcall(vlc.input.is_playing)
-        if ok then return playing end
-    end
-    if vlc.object and vlc.object.input then return vlc.object.input() ~= nil end
-    return false
-end
-
-local function playlist_stopped()
-    local ok, status = pcall(vlc.playlist.status)
-    return ok and status == "stopped"
-end
+local function basename(path) return (path or ""):match("([^/\\]+)$") or path or "" end
+local function dirname(path)  return (path or ""):match("^(.*)[/\\][^/\\]*$") or "." end
+local function extension(path) return ((path or ""):match("%.([%w]+)$") or ""):lower() end
+local function value_of(widget) return (widget:get_value()) end
 
 local function to_path(p)
     if not p or p == "" then return nil end
     if p:match("^%a[%w+.-]*://") then
+        if not p:match("^[Ff][Ii][Ll][Ee]://") then return nil end   -- http, vlc://, dvd://...
         local ok, path = pcall(vlc.strings.make_path, p)
         if ok and path then return path end
         return (vlc.strings.decode_uri(p):gsub("^file://", ""))
@@ -131,49 +106,165 @@ local function to_path(p)
     return p
 end
 
---- The parentheses matter: get_value() returns the id AND its label, so passing
---- the call straight into tonumber() hands the label over as a numeric base.
-local function value_of(widget)
-    return (widget:get_value())
-end
-
-local function basename(path)
-    return (path or ""):match("([^/\\]+)$") or path
-end
-
 local function format_time(seconds)
     if not seconds or seconds < 0 then return "--:--" end
     seconds = math.floor(seconds)
-    local h = math.floor(seconds / 3600)
-    local m = math.floor((seconds % 3600) / 60)
+    local h, m = math.floor(seconds / 3600), math.floor((seconds % 3600) / 60)
     if h > 0 then return string.format("%d:%02d:%02d", h, m, seconds % 60) end
     return string.format("%d:%02d", m, seconds % 60)
 end
 
 local function progress_bar(fraction)
     local filled = math.floor((fraction or 0) * BAR_WIDTH + 0.5)
-    if filled < 0 then filled = 0 end
-    if filled > BAR_WIDTH then filled = BAR_WIDTH end
-    return string.rep("\226\150\136", filled)
-        .. string.rep("\226\150\145", BAR_WIDTH - filled)
+    filled = math.max(0, math.min(BAR_WIDTH, filled))
+    return string.rep("\226\150\136", filled) .. string.rep("\226\150\145", BAR_WIDTH - filled)
 end
 
---- Output size so far, used for the percentage: more reliable than input
---- position, which is relative to the untrimmed source file.
+local function read_file(path)
+    local f = io.open(path, "rb")
+    if not f then return nil end
+    local text = f:read("*a"); f:close()
+    return text
+end
+
+local function write_file(path, text)
+    local f, err = io.open(path, "wb")
+    if not f then return false, err end
+    f:write(text); f:close()
+    return true
+end
+
 local function file_size(path)
-    local ok, size = pcall(function()
-        local f = io.open(path, "rb")
-        if not f then return 0 end
-        local n = f:seek("end") or 0
-        f:close()
-        return n
-    end)
-    return ok and size or 0
+    local f = io.open(path, "rb")
+    if not f then return 0 end
+    local n = f:seek("end") or 0
+    f:close()
+    return n
 end
 
 local function delete_file(path)
     pcall(function() os.remove(path) end)
     pcall(function() vlc.io.unlink(path) end)
+end
+
+local function escape_pattern(s) return (s:gsub("[^%w]", "%%%0")) end
+
+--- Quote a value for the shell that will run it. `in_script` doubles % for .bat
+--- files, where cmd.exe would otherwise expand it.
+local function quote(s, in_script)
+    s = tostring(s)
+    if IS_WINDOWS then
+        s = s:gsub('"', '""')
+        if in_script then s = s:gsub("%%", "%%%%") end
+        return '"' .. s .. '"'
+    end
+    return "'" .. s:gsub("'", "'\\''") .. "'"
+end
+
+local function shell_ok(cmd)
+    local ok, _, code = os.execute(cmd)
+    return ok == true or ok == 0 or code == 0
+end
+
+local function popen_read(cmd)
+    if IS_WINDOWS then cmd = '"' .. cmd .. '"' end    -- cmd /c quote-stripping rule
+    local f = io.popen(cmd, "r")
+    if not f then return "" end
+    local out = f:read("*a") or ""
+    f:close()
+    return out
+end
+
+--=============================================================================
+-- ffmpeg
+--=============================================================================
+
+local function ffmpeg_works(path)
+    if not path or path == "" then return false end
+    local cmd = quote(path) .. " -version"
+    cmd = cmd .. (IS_WINDOWS and " >NUL 2>&1" or " >/dev/null 2>&1")
+    if IS_WINDOWS then cmd = '"' .. cmd .. '"' end
+    return shell_ok(cmd)
+end
+
+--- GUI applications (macOS especially) often lack the shell's PATH, so also try
+--- the places package managers install to.
+local function find_ffmpeg()
+    local candidates = { "ffmpeg" }
+    if IS_WINDOWS then
+        candidates[#candidates + 1] = "C:\\ffmpeg\\bin\\ffmpeg.exe"
+        candidates[#candidates + 1] = "C:\\Program Files\\ffmpeg\\bin\\ffmpeg.exe"
+    else
+        for _, p in ipairs({ "/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg",
+                             "/usr/bin/ffmpeg", "/snap/bin/ffmpeg" }) do
+            candidates[#candidates + 1] = p
+        end
+    end
+    for _, c in ipairs(candidates) do
+        if ffmpeg_works(c) then return c end
+    end
+    return nil
+end
+
+--- Ask ffmpeg what a file contains. Images are not probed: a still has no
+--- duration, and its length comes from the settings instead.
+local function probe(ffmpeg, path)
+    local out = popen_read(quote(ffmpeg) .. " -hide_banner -nostdin -i " .. quote(path) .. " 2>&1")
+    local info = { video = false, cover = false, audio = false, duration = nil }
+    for line in out:gmatch("[^\r\n]+") do
+        if line:find("Stream #[%d:]+[^:]*: Video:") then
+            if line:find("attached pic", 1, true) then info.cover = true else info.video = true end
+        elseif line:find("Stream #[%d:]+[^:]*: Audio:") then
+            info.audio = true
+        end
+    end
+    local h, m, s = out:match("Duration:%s*(%d+):(%d+):([%d.]+)")
+    if h then info.duration = tonumber(h) * 3600 + tonumber(m) * 60 + tonumber(s) end
+    return info
+end
+
+--=============================================================================
+-- reading the playlist
+--=============================================================================
+
+local function resolve_entry(raw, dir)
+    if raw:match("^[Ff][Ii][Ll][Ee]://") then return to_path(raw) end
+    if raw:match("^%a[%w+.-]*://") then return nil end
+    if raw:match("^/") or raw:match("^%a:[/\\]") or raw:match("^\\\\") then return raw end
+    return dir .. SEP .. raw
+end
+
+--- Parse an .m3u/.m3u8 ourselves: VLC does not expose the #EXTVLCOPT trims of
+--- the playlist's entries to Lua. Returns items, number_skipped.
+local function read_m3u(path)
+    local text = read_file(path)
+    if not text then return nil, 0 end
+    text = text:gsub("^\239\187\191", "")
+    local dir = dirname(path)
+    local items, skipped, opts = {}, 0, {}
+    for line in text:gmatch("[^\r\n]+") do
+        line = line:gsub("^%s+", ""):gsub("%s+$", "")
+        if line == "" then
+            -- blank
+        elseif line:sub(1, 1) == "#" then
+            local k, v = line:match("^#EXTVLCOPT:([%w%-]+)=(.*)$")
+            if k then opts[k] = v end
+        else
+            local p = resolve_entry(line, dir)
+            if p then
+                items[#items + 1] = {
+                    path = p,
+                    start = tonumber(opts["start-time"]),
+                    stop = tonumber(opts["stop-time"]),
+                    image_seconds = tonumber(opts["image-duration"]),
+                }
+            else
+                skipped = skipped + 1
+            end
+            opts = {}
+        end
+    end
+    return items, skipped
 end
 
 local function root_children()
@@ -182,168 +273,340 @@ local function root_children()
     return root.children or {}
 end
 
-local function find_item(id)
-    for _, item in ipairs(root_children()) do
-        if item.id == id then return item end
+local function collect_tree(list, out, skipped)
+    for _, item in ipairs(list) do
+        if item.children and #item.children > 0 then
+            collect_tree(item.children, out, skipped)
+        else
+            local p = to_path(item.path)
+            if p and not PLAYLIST_EXTS[extension(p)] then
+                out[#out + 1] = { path = p }
+            elseif not p then
+                skipped.n = skipped.n + 1
+            end
+        end
     end
-    return nil
 end
 
 local function find_sources()
     local found = {}
     for _, item in ipairs(root_children()) do
         local path = to_path(item.path)
-        local ext = ((path or ""):match("%.([%w]+)$") or ""):lower()
-        local expanded = item.children and #item.children > 0
-        if PLAYLIST_EXTS[ext] or expanded then
-            found[#found + 1] = {
-                id = item.id,
-                path = path,
-                label = basename(path) or item.name,
-                tracks = expanded and #item.children or nil,
-            }
+        local ext = extension(path)
+        if ext == "m3u" or ext == "m3u8" then
+            found[#found + 1] = { kind = "m3u", path = path, label = basename(path) }
+        elseif item.children and #item.children > 0 then
+            found[#found + 1] = { kind = "tree", list = item.children,
+                                  label = (basename(path) ~= "" and basename(path)) or item.name or "playlist" }
         end
+    end
+    local everything = { n = 0 }
+    local all = {}
+    collect_tree(root_children(), all, everything)
+    if #all > 0 then
+        found[#found + 1] = { kind = "all", label = "Everything in the VLC playlist", count = #all }
     end
     return found
 end
 
-local function default_output_for(path)
-    return ((path or ""):gsub("%.[%w]+$", "")) .. ".m4a"
+local function load_items(source)
+    if source.kind == "m3u" then return read_m3u(source.path) end
+    local out, skipped = {}, { n = 0 }
+    if source.kind == "tree" then collect_tree(source.list, out, skipped)
+    else collect_tree(root_children(), out, skipped) end
+    return out, skipped.n
 end
 
---- One-off record of what this build puts in the extension sandbox. It differs
---- from the interface sandbox and the difference is documented nowhere.
-local function probe_sandbox()
-    local names = {}
-    for key, value in pairs(vlc) do names[#names + 1] = key .. ":" .. type(value) end
-    table.sort(names)
-    log("SANDBOX vlc = " .. table.concat(names, " "))
-    log("SANDBOX os=" .. type(os) .. " io=" .. type(io)
-     .. " os.time=" .. type(os and os.time))
+local function default_output_for(source, items)
+    if source.kind == "m3u" then return (source.path:gsub("%.[%w]+$", "")) .. ".mp4" end
+    local first = items and items[1] and items[1].path
+    return (first and dirname(first) or ".") .. SEP .. "merged.mp4"
+end
+
+--=============================================================================
+-- building the job
+--=============================================================================
+
+-- Every clip is normalised to the same picture size, frame rate and audio
+-- format, with video and audio lengths made exactly equal, then the clips are
+-- joined without re-encoding the picture. Exact lengths matter: a few
+-- milliseconds of error per clip would otherwise add up to visible drift.
+local function video_filters(o)
+    return table.concat({
+        "scale=w=iw*sar:h=ih", "setsar=1",
+        string.format("scale=%d:%d:force_original_aspect_ratio=decrease:force_divisible_by=2", o.w, o.h),
+        string.format("pad=%d:%d:(ow-iw)/2:(oh-ih)/2:color=black", o.w, o.h),
+        "setsar=1", "fps=" .. FPS, "format=yuv420p",
+    }, ",")
+end
+
+local AUDIO_FILTERS = "aresample=48000,aformat=sample_fmts=s16:channel_layouts=stereo"
+local SILENCE = "-f lavfi -i anullsrc=channel_layout=stereo:sample_rate=48000"
+
+local function seconds(n) return string.format("%.6f", n) end
+
+--- Describe how to turn one playlist item into a normalised clip. Returns nil
+--- and a reason when the item cannot be used.
+local function plan_item(ffmpeg, item, o)
+    local ext = extension(item.path)
+    if file_size(item.path) == 0 then return nil, "file not found" end
+
+    local plan = { name = basename(item.path), item = item }
+    if IMAGE_EXTS[ext] then
+        plan.kind = "image"
+        plan.length = item.image_seconds or o.image_seconds
+    else
+        local info = probe(ffmpeg, item.path)
+        if not (info.video or info.cover or info.audio) then return nil, "not a media file" end
+        plan.kind = info.video and "video" or "audio"
+        plan.info = info
+        local stop = item.stop
+        if info.duration and (not stop or stop > info.duration) then stop = info.duration end
+        if stop then plan.length = stop - (item.start or 0) end
+    end
+
+    if plan.length then
+        if plan.length <= 0 then return nil, "empty time range" end
+        plan.frames = math.max(1, math.floor(plan.length * FPS + 0.5))
+        plan.length = plan.frames / FPS
+    end
+    return plan
+end
+
+local function segment_command(ffmpeg, plan, index, o)
+    local inputs, vlabel, alabel = {}, nil, nil
+    local exact = plan.length ~= nil
+    local vpre = ""
+    local ss = plan.item.start and ("-ss " .. seconds(plan.item.start) .. " ") or ""
+
+    if plan.kind == "image" then
+        inputs[1] = string.format("-f image2 -pattern_type none -loop 1 -framerate %d -i %s",
+                                  FPS, quote(plan.item.path, true))
+        inputs[2] = SILENCE
+        vlabel, alabel = "[0:v]", "[1:a]"
+    elseif plan.kind == "video" then
+        inputs[1] = ss .. "-i " .. quote(plan.item.path, true)
+        vlabel = "[0:v:0]"
+        if plan.info.audio then alabel = "[0:a:0]" else inputs[2] = SILENCE; alabel = "[1:a]" end
+    else   -- audio only: show the cover art if there is one, black otherwise
+        inputs[1] = ss .. "-i " .. quote(plan.item.path, true)
+        alabel = "[0:a:0]"
+        if plan.info.cover then
+            vlabel = "[0:v:0]"
+            -- A looped single frame keeps its timestamp unless it is renumbered.
+            vpre = "loop=loop=-1:size=1,setpts=N/(" .. FPS .. "*TB),"
+        else
+            inputs[2] = string.format("-f lavfi -i color=c=black:s=%dx%d:r=%d", o.w, o.h, FPS)
+            vlabel = "[1:v]"
+        end
+    end
+
+    local vf = vpre .. video_filters(o)
+    local af = AUDIO_FILTERS
+    if exact then
+        vf = vf .. ",tpad=stop=-1:stop_mode=clone"
+        af = af .. ",apad"
+    end
+    vf = vf .. ",setpts=PTS-STARTPTS"
+    af = af .. ",asetpts=PTS-STARTPTS"
+
+    local out = string.format("seg%04d.mov", index)
+    local limit = exact and ("-t " .. seconds(plan.length)) or "-shortest"
+    local cmd = table.concat({
+        quote(ffmpeg, true), "-nostdin -hide_banner -loglevel error -y",
+        table.concat(inputs, " "),
+        "-filter_complex", quote(vlabel .. vf .. "[v];" .. alabel .. af .. "[a]", true),
+        "-map [v] -map [a]", limit,
+        string.format("-c:v libx264 -preset veryfast -crf %d -pix_fmt yuv420p -r %d", o.crf, FPS),
+        "-c:a pcm_s16le -ar 48000 -ac 2", out,
+    }, " ")
+    return cmd, out
+end
+
+--- Produce the shell script for the whole job. Pure text generation, so it can
+--- be tested without VLC.
+local function build_script(ffmpeg, plans, o)
+    local lines, list = {}, {}
+    local function add(s) lines[#lines + 1] = s end
+    local total = #plans + 1
+    local partial = o.output .. ".partial.mp4"
+
+    if IS_WINDOWS then
+        add("@echo off")
+        add("cd /d " .. quote(o.dir, true))
+        add("echo running> status.txt")
+    else
+        add("#!/bin/sh")
+        add("cd " .. quote(o.dir) .. " || exit 1")
+        add("echo $$ > pid")
+        add("echo running > status.txt")
+    end
+
+    for i, plan in ipairs(plans) do
+        local cmd, seg = segment_command(ffmpeg, plan, i, o)
+        list[#list + 1] = "file '" .. seg .. "'"
+        if IS_WINDOWS then
+            add("if exist cancel.flag goto cancelled")
+            add(cmd .. " 2>> log.txt")
+            add("if errorlevel 1 goto failed")
+            add("echo " .. i .. "> progress.txt")
+        else
+            add("[ -e cancel.flag ] && { echo cancelled > status.txt; exit 0; }")
+            add(cmd .. " 2>> log.txt || { echo failed > status.txt; exit 1; }")
+            add("echo " .. i .. " > progress.txt")
+        end
+    end
+
+    local final = table.concat({
+        quote(ffmpeg, true), "-nostdin -hide_banner -loglevel error -y",
+        "-f concat -safe 0 -i list.txt -map 0:v:0 -map 0:a:0",
+        string.format("-c:v copy -c:a aac -b:a %dk -movflags +faststart -f mp4", AUDIO_KBPS),
+        quote(partial, true),
+    }, " ")
+    if IS_WINDOWS then
+        add("if exist cancel.flag goto cancelled")
+        add(final .. " 2>> log.txt")
+        add("if errorlevel 1 goto failed")
+        add("move /Y " .. quote(partial, true) .. " " .. quote(o.output, true) .. " >NUL")
+        add("if errorlevel 1 goto failed")
+        add("echo done> status.txt")
+        add("exit /b 0")
+        add(":cancelled")
+        add("del " .. quote(partial, true) .. " 2>NUL")
+        add("echo cancelled> status.txt")
+        add("exit /b 0")
+        add(":failed")
+        add("del " .. quote(partial, true) .. " 2>NUL")
+        add("echo failed> status.txt")
+        add("exit /b 1")
+    else
+        add("[ -e cancel.flag ] && { echo cancelled > status.txt; exit 0; }")
+        add(final .. " 2>> log.txt || { rm -f " .. quote(partial) .. "; echo failed > status.txt; exit 1; }")
+        add("mv -f " .. quote(partial) .. " " .. quote(o.output) .. " || { echo failed > status.txt; exit 1; }")
+        add("echo done > status.txt")
+    end
+    return table.concat(lines, IS_WINDOWS and "\r\n" or "\n") .. (IS_WINDOWS and "\r\n" or "\n"),
+           table.concat(list, "\n") .. "\n", total
 end
 
 --=============================================================================
 -- dialog pages
 --=============================================================================
 
-local on_convert, on_confirm_overwrite, on_cancel_merge, show_setup
+local on_convert, start_merge, on_cancel_merge, on_refresh, show_setup
 
--- Deleted dialogs are parked here forever, never dropped. See reset_dialog.
-local retained_dialogs = {}
-
---- Build a fresh dialog page.
----
---- The old dialog must be deleted, not merely hidden: VLC will not display a
---- new dialog while a previous one is alive, and hiding alone makes the next
---- page silently fail to appear.
----
---- But a deleted dialog's collector throws "Can't get pointer to dialog", and
---- that error lands inside whatever unrelated callback happens to trigger the
---- collection -- once aborting the merge's own teardown. Keeping a reference
---- forever means the collector never runs. A few stale handles per session is a
---- cheap price for removing an error that can strike anywhere.
----
---- Only ever call this from a button handler. dlg:delete() from a listener
---- callback deadlocks against the Qt thread and VLC has to be killed.
 local function reset_dialog()
     if dlg then
         pcall(function() dlg:hide() end)
         pcall(function() dlg:delete() end)
-        retained_dialogs[#retained_dialogs + 1] = dlg
+        retained_dialogs[#retained_dialogs + 1] = dlg    -- see README: never let it be collected
     end
-    dlg = vlc.dialog("Merge Playlist into one File")
+    dlg = vlc.dialog("Merge Playlist into one Video")
     ui = {}
 end
 
---- Report the outcome by rewriting the progress page in place. A merge can
---- finish inside a listener callback, where building a new dialog is unsafe,
---- and set_text/update are the only dialog calls proven to work there.
-local function show_result_in_place(headline, detail, fraction)
-    if not (dlg and ui.title and ui.track) then return false end
-    pcall(function() ui.title:set_text("<b>" .. headline .. "</b>") end)
-    pcall(function() ui.track:set_text(detail or "") end)
-    pcall(function() ui.bar:set_text(string.format("%s  %d%%",
-        progress_bar(fraction), math.floor(fraction * 100))) end)
-    pcall(function() ui.eta:set_text("") end)
-    pcall(function() ui.note:set_text("") end)
-    pcall(function() ui.stop:set_text("Close") end)
-    pcall(function() dlg:update() end)
-    return true
-end
-
-local function show_result(headline, detail)
-    reset_dialog()
-    ui.title = dlg:add_label("<b>" .. headline .. "</b>", 1, 1, 3, 1)
-    ui.detail = dlg:add_label(detail or "", 1, 2, 3, 1)
-    ui.again = dlg:add_button("Back", function() show_setup() end, 2, 3, 1, 1)
-    ui.close = dlg:add_button("Close", function() vlc.deactivate() end, 3, 3, 1, 1)
-    dlg:show()
-end
-
---- Wrap a callback so a Lua error reaches the dialog instead of vanishing.
 local function guarded(name, fn)
     return function(...)
         local ok, err = pcall(fn, ...)
         if not ok then
             log("!! " .. name .. " failed: " .. tostring(err))
-            pcall(show_result, "Something went wrong",
-                  "<b>" .. name .. "</b> failed:<br><br>" .. tostring(err)
-               .. "<br><br>A copy of this is in " .. resolve_trace_path())
+            pcall(function()
+                reset_dialog()
+                ui.title = dlg:add_label("<b>Something went wrong</b>", 1, 1, 3, 1)
+                ui.detail = dlg:add_label("<b>" .. name .. "</b> failed:<br><br>" .. tostring(err)
+                    .. "<br><br>A copy is in " .. resolve_trace_path(), 1, 2, 3, 1)
+                ui.back = dlg:add_button("Back", function() show_setup() end, 2, 3, 1, 1)
+                ui.close = dlg:add_button("Close", function() vlc.deactivate() end, 3, 3, 1, 1)
+                dlg:show()
+            end)
         end
     end
 end
+
+local function show_message(headline, detail)
+    reset_dialog()
+    ui.title = dlg:add_label("<b>" .. headline .. "</b>", 1, 1, 3, 1)
+    ui.detail = dlg:add_label(detail or "", 1, 2, 3, 1)
+    ui.back = dlg:add_button("Back", function() show_setup() end, 2, 3, 1, 1)
+    ui.close = dlg:add_button("Close", function() vlc.deactivate() end, 3, 3, 1, 1)
+    dlg:show()
+end
+
+local ffmpeg_guess = nil
 
 show_setup = function()
     reset_dialog()
     sources = find_sources()
 
     if #sources == 0 then
-        ui.msg = dlg:add_label(
-            "<b>No playlist found.</b><br>Open a playlist file (.m3u8, .xspf, "
-         .. "...) in VLC first, then run this again.", 1, 1, 3, 1)
-        ui.close = dlg:add_button("Close", function() vlc.deactivate() end, 3, 2, 1, 1)
+        dlg:add_label("<b>Nothing to merge.</b><br>Open a playlist file (.m3u8) or add your "
+            .. "videos and images to VLC's playlist first, then run this again.", 1, 1, 3, 1)
+        dlg:add_button("Close", function() vlc.deactivate() end, 3, 2, 1, 1)
         dlg:show()
         return
     end
+    if ffmpeg_guess == nil then ffmpeg_guess = find_ffmpeg() or false end
 
-    ui.src_label = dlg:add_label("<b>Playlist</b>", 1, 1, 1, 1)
-    ui.src = dlg:add_dropdown(2, 1, 2, 1)
+    local row = 1
+    dlg:add_label("<b>Playlist</b>", 1, row, 1, 1)
+    ui.src = dlg:add_dropdown(2, row, 2, 1)
     for index, source in ipairs(sources) do
         local text = source.label
-        if source.tracks then
-            text = string.format("%s  (%d tracks)", text, source.tracks)
-        end
+        if source.count then text = string.format("%s  (%d items)", text, source.count) end
         ui.src:add_value(text, index)
     end
 
-    ui.out_label = dlg:add_label("<b>Save as</b>", 1, 2, 1, 1)
-    ui.out = dlg:add_text_input(default_output_for(sources[1].path), 2, 2, 2, 1)
+    row = row + 1
+    dlg:add_label("<b>Playlist file</b>", 1, row, 1, 1)
+    ui.file = dlg:add_text_input("", 2, row, 2, 1)
 
-    ui.rate_label = dlg:add_label("<b>Quality</b>", 1, 3, 1, 1)
-    ui.rate = dlg:add_dropdown(2, 3, 1, 1)
-    for _, rate in ipairs(BITRATES) do
-        ui.rate:add_value(rate .. " kbps stereo", tonumber(rate))
+    row = row + 1
+    dlg:add_label("<b>Save as</b>", 1, row, 1, 1)
+    local first_items = nil
+    if sources[1].kind ~= "m3u" then first_items = load_items(sources[1]) end
+    ui.out = dlg:add_text_input(default_output_for(sources[1], first_items), 2, row, 2, 1)
+
+    row = row + 1
+    dlg:add_label("<b>Picture size</b>", 1, row, 1, 1)
+    ui.size = dlg:add_dropdown(2, row, 2, 1)
+    for i, s in ipairs(SIZES) do ui.size:add_value(s.label, i) end
+
+    row = row + 1
+    dlg:add_label("<b>Quality</b>", 1, row, 1, 1)
+    ui.quality = dlg:add_dropdown(2, row, 2, 1)
+    for i, q in ipairs(QUALITIES) do ui.quality:add_value(q.label, i) end
+
+    row = row + 1
+    dlg:add_label("<b>Seconds per image</b>", 1, row, 1, 1)
+    ui.secs = dlg:add_text_input(tostring(DEFAULT_IMAGE_SECONDS), 2, row, 1, 1)
+
+    row = row + 1
+    dlg:add_label("<b>ffmpeg</b>", 1, row, 1, 1)
+    ui.ffmpeg = dlg:add_text_input(ffmpeg_guess or "ffmpeg", 2, row, 2, 1)
+
+    row = row + 1
+    local hint = "Videos, images and audio files are joined in playlist order into one MP4.<br>"
+              .. "To keep start-time / stop-time trims and per-item image-duration, type the path "
+              .. "of the .m3u8 playlist file in <b>Playlist file</b> (VLC does not pass those on "
+              .. "for items already in its playlist)."
+    if not ffmpeg_guess then
+        hint = "<b>ffmpeg was not found.</b> Install it (ffmpeg.org) or type its full path above.<br>" .. hint
     end
+    dlg:add_label(hint, 1, row, 3, 1)
 
-    ui.hint = dlg:add_label(
-        "The tracks are joined into one AAC/M4A file, keeping each track's "
-     .. "start and stop times.<br>VLC cannot play anything else while it works "
-     .. "(roughly one minute per hour of audio).", 1, 4, 3, 1)
-
-    ui.convert = dlg:add_button("Convert", guarded("Convert", function() on_convert() end), 2, 5, 1, 1)
-    ui.cancel = dlg:add_button("Close", function() vlc.deactivate() end, 3, 5, 1, 1)
+    row = row + 1
+    ui.convert = dlg:add_button("Merge", guarded("Merge", function() on_convert() end), 2, row, 1, 1)
+    dlg:add_button("Close", function() vlc.deactivate() end, 3, row, 1, 1)
     dlg:show()
 end
 
 local function confirm_overwrite(output)
     reset_dialog()
-    ui.title = dlg:add_label("<b>" .. basename(output) .. " already exists</b>", 1, 1, 3, 1)
-    ui.detail = dlg:add_label(
-        "Merging will replace it. The existing file cannot be recovered "
-     .. "afterwards.<br><br>" .. output, 1, 2, 3, 1)
-    ui.ok = dlg:add_button("Replace",
-        guarded("Replace", function() on_confirm_overwrite() end), 2, 3, 1, 1)
-    ui.back = dlg:add_button("Back", function() show_setup() end, 3, 3, 1, 1)
+    dlg:add_label("<b>" .. basename(output) .. " already exists</b>", 1, 1, 3, 1)
+    dlg:add_label("Merging will replace it. The existing file cannot be recovered "
+        .. "afterwards.<br><br>" .. output, 1, 2, 3, 1)
+    dlg:add_button("Replace", guarded("Replace", function() start_merge() end), 2, 3, 1, 1)
+    dlg:add_button("Back", function() show_setup() end, 3, 3, 1, 1)
     dlg:show()
 end
 
@@ -353,321 +616,217 @@ local function show_progress_page(source_label, output)
     ui.track = dlg:add_label("Starting\226\128\166", 1, 2, 3, 1)
     ui.bar = dlg:add_label(progress_bar(0), 1, 3, 3, 1)
     ui.eta = dlg:add_label("", 1, 4, 3, 1)
-    ui.out = dlg:add_label("\226\134\146 " .. output, 1, 5, 3, 1)
-    ui.note = dlg:add_label(
-        "<i>Progress steps forward as each track finishes.</i>", 1, 6, 3, 1)
-    ui.stop = dlg:add_button("Cancel merge",
-        guarded("Cancel", function() on_cancel_merge() end), 2, 7, 1, 1)
+    dlg:add_label("\226\134\146 " .. output, 1, 5, 3, 1)
+    ui.note = dlg:add_label("<i>Press Refresh to update. You can keep using VLC meanwhile.</i>", 1, 6, 3, 1)
+    ui.refresh = dlg:add_button("Refresh", guarded("Refresh", function() on_refresh() end), 1, 7, 1, 1)
+    ui.stop = dlg:add_button("Cancel merge", guarded("Cancel", function() on_cancel_merge() end), 2, 7, 1, 1)
     dlg:show()
 end
 
-local function update_progress()
-    if not job or not ui.track then return end
-
-    -- Two independent estimates, whichever is further along. Bytes written give
-    -- movement within a track; completed track durations keep the bar honest if
-    -- the output cannot be measured at all.
-    local fraction = 0
-    if job.expected_bytes and job.expected_bytes > 0 then
-        fraction = file_size(job.output) / job.expected_bytes
-    end
-    if job.total_seconds > 0 then
-        local done = 0
-        for index = 1, math.min(job.index - 1, #job.tracks) do
-            done = done + job.tracks[index].duration
-        end
-        fraction = math.max(fraction, done / job.total_seconds)
-    end
-    if fraction > 0.99 then fraction = 0.99 end
-
-    ui.track:set_text(string.format("Track %d of %d \226\128\148 %s",
-        math.max(job.index, 1), #job.tracks, job.name or "?"))
-    ui.bar:set_text(string.format("%s  %d%%",
-        progress_bar(fraction), math.floor(fraction * 100)))
-
-    local elapsed = job.t0 and now() and (now() - job.t0) or nil
-    if elapsed and fraction > 0.02 and elapsed > 2 then
-        ui.eta:set_text(string.format("Elapsed %s \226\128\148 about %s left",
-            format_time(elapsed), format_time(elapsed / fraction - elapsed)))
-    elseif elapsed then
-        ui.eta:set_text("Elapsed " .. format_time(elapsed))
-    end
-    dlg:update()
-end
-
 --=============================================================================
--- the merge
+-- running the job
 --=============================================================================
 
---- Quote a path for a sout chain. An unquoted value ends at the first special
---- character, so an apostrophe -- as in Al-Qur'an -- swallows the chain's
---- closing brace and the file is written as "wird-3.m4a}". Backslashes have to
---- be doubled, which is every separator in a Windows path.
-local function sout_quote(path)
-    return '"' .. (path:gsub("\\", "\\\\"):gsub('"', '\\"')) .. '"'
+local function job_file(name) return job.dir .. SEP .. name end
+
+local function read_status()
+    local s = read_file(job_file("status.txt"))
+    return s and s:match("%a+") or nil
 end
 
-local function build_sout(output, bitrate)
-    return string.format(
-        "#transcode{acodec=mp4a,ab=%d,channels=2,samplerate=48000}"
-     .. ":gather:std{access=file,mux=mp4,dst=%s}", bitrate, sout_quote(output))
+local function read_progress()
+    local p = read_file(job_file("progress.txt"))
+    return tonumber(p and p:match("%d+")) or 0
 end
 
---- Add our own copy of the playlist file carrying the sout options, leaving the
---- user's own entry untouched. Returns the new node's id.
-local function add_conversion_item(source_path, sout)
-    local before = {}
-    for _, item in ipairs(root_children()) do before[item.id] = true end
-
-    vlc.playlist.add({{
-        path = vlc.strings.make_uri(source_path),
-        options = { ":sout=" .. sout, ":sout-keep" },
-    }})
-
-    for _, item in ipairs(root_children()) do
-        if not before[item.id] then return item.id end
-    end
-    return nil
+local function pid_alive()
+    if IS_WINDOWS then return true end
+    local pid = (read_file(job_file("pid")) or ""):match("%d+")
+    if not pid then return true end     -- not written yet
+    return shell_ok("kill -0 " .. pid .. " >/dev/null 2>&1")
 end
 
---- Wait for VLC to preparse the playlist file into children, and snapshot their
---- durations now: once a track plays, its reported duration becomes the source
---- file's full length rather than the trimmed segment.
-local function await_expansion(node_id)
-    for _ = 1, math.ceil(EXPAND_TIMEOUT / POLL) do
-        sleep(POLL)
-        local node = find_item(node_id)
-        if node and node.children and #node.children > 0 then
-            local tracks, total = {}, 0
-            for index, child in ipairs(node.children) do
-                local duration = math.max(child.duration or 0, 0)
-                -- Keep each track's location: the current track is identified by
-                -- matching against these, never by counting change events.
-                tracks[index] = {
-                    id = child.id,
-                    duration = duration,
-                    key = to_path(child.path) or child.path,
-                }
-                total = total + duration
-            end
-            return tracks, total
+local function cleanup_job_dir(dir)
+    local ok, entries = pcall(vlc.io.readdir, dir)
+    if not ok or not entries then return end
+    for _, name in ipairs(entries) do
+        if name ~= "log.txt" and name ~= "." and name ~= ".." then
+            delete_file(dir .. SEP .. name)
         end
     end
-    return nil, 0
 end
 
---- Play a throwaway item so VLC tears down the kept stream output. Without it
---- the MP4 moov atom is never written and the file is unplayable. Note that
---- playlist.stop() does NOT have this effect.
-local function flush_sout()
-    local before = {}
-    for _, item in ipairs(root_children()) do before[item.id] = true end
-
-    log("flush: add vlc://nop")
-    vlc.playlist.add({{ path = "vlc://nop" }})
-
-    local nop_id
-    for _, item in ipairs(root_children()) do
-        if not before[item.id] then nop_id = item.id end
-    end
-    if not nop_id then log("flush: no nop item"); return end
-
-    log("flush: gotoitem " .. tostring(nop_id))
-    vlc.playlist.gotoitem(nop_id)
-    sleep(0.3)
-    log("flush: play")
-    vlc.playlist.play()
-    sleep(2)
-    log("flush: delete nop")
-    pcall(function() vlc.playlist.delete(nop_id) end)
-    log("flush: done")
+--- Update the progress page in place. Only set_text/update are safe from the
+--- listener callbacks that also call this.
+local function set_result(headline, detail, fraction)
+    if not (dlg and ui.title and ui.track) then return end
+    pcall(function() ui.title:set_text("<b>" .. headline .. "</b>") end)
+    pcall(function() ui.track:set_text(detail or "") end)
+    pcall(function() ui.bar:set_text(string.format("%s  %d%%", progress_bar(fraction), math.floor(fraction * 100))) end)
+    pcall(function() ui.eta:set_text("") end)
+    pcall(function() ui.note:set_text("") end)
+    pcall(function() ui.stop:set_text("Close") end)
+    pcall(function() dlg:update() end)
 end
 
---- Tear down and report. Called once, from whichever callback notices the end.
-local function finish_merge(reason)
-    if not job or job.state ~= "running" then return end
-    job.state = "finishing"
+local function refresh()
+    if not job or job.finished then return end
+    local status = read_status()
+    local done_steps = read_progress()
+    local total = job.total
 
-    local tracks, reached, output = #job.tracks, job.index, job.output
-    local total_seconds, node_id = job.total_seconds, job.node_id
-    local matched = job.matched
-    log(string.format("finishing (%s): reached track %d of %d (matched=%s)",
-        reason, reached, tracks, tostring(matched)))
+    if status == "running" and not pid_alive() then status = "failed" end
 
-    -- Wrapped: an error escaping here would skip the flush, and without the
-    -- flush the MP4 has no moov atom and the whole merge is unplayable. That
-    -- already happened once, via a stray collector error.
-    log("finish: entering flush_sout (context=" .. tostring(reason) .. ")")
-    local flushed, flush_err = pcall(flush_sout)
-    if not flushed then log("!! flush_sout failed: " .. tostring(flush_err)) end
-    log("finish: deleting conversion node " .. tostring(node_id))
-    pcall(function() vlc.playlist.delete(node_id) end)
-    log("finish: node deleted")
-    job = nil
-
-    -- Only discard when we are sure it is incomplete. If no track ever matched
-    -- the snapshot we cannot judge, and keeping a possibly-short file beats
-    -- deleting a good one.
-    if reason == "cancelled" or (matched and reached < tracks) then
-        delete_file(output)
-        local detail = string.format(
-            "Only %d of %d tracks were merged, so the partial file was "
-         .. "discarded \226\128\148 an interrupted M4A is not playable.",
-            reached, tracks)
-        if not show_result_in_place("Stopped early", detail, 0) then
-            log("could not report in place: " .. detail)
+    if status == "done" or status == "failed" or status == "cancelled" then
+        job.finished = true
+        local output, dir, skipped = job.output, job.dir, job.skipped
+        local log_note = ""
+        if status == "failed" then
+            local tail = (read_file(dir .. SEP .. "log.txt") or ""):gsub("%s+$", "")
+            tail = tail:sub(-400)
+            log_note = "<br><br>ffmpeg said:<br>" .. tail:gsub("\n", "<br>")
+                    .. "<br><br>Full log: " .. dir .. SEP .. "log.txt"
         end
+        local elapsed = format_time(now() - job.t0)
+        local plans = #job.plans
+        if status == "done" then
+            local extra = skipped > 0 and string.format("<br>%d item(s) were skipped (see merge_playlist.log).", skipped) or ""
+            set_result("Done", string.format("Saved <b>%s</b><br>%d clips \226\128\148 %.0f MB \226\128\148 took %s.%s",
+                basename(output), plans, file_size(output) / (1024 * 1024), elapsed, extra), 1)
+        elseif status == "cancelled" then
+            set_result("Cancelled", "The merge was stopped and no file was written.", 0)
+        else
+            set_result("The merge failed", "ffmpeg stopped with an error." .. log_note, done_steps / total)
+        end
+        cleanup_job_dir(dir)
+        job = nil
         return
     end
 
-    local detail = string.format(
-        "Saved <b>%s</b><br>%s of audio \226\128\148 %.0f MB \226\128\148 "
-     .. "%d tracks merged.",
-        basename(output), format_time(total_seconds),
-        file_size(output) / (1024 * 1024), tracks)
-    if not show_result_in_place("Done", detail, 1) then
-        log("could not report in place: " .. detail)
+    local fraction = math.min(done_steps / total, 0.99)
+    local label
+    if done_steps >= #job.plans then label = "Joining everything together\226\128\166"
+    else label = string.format("Clip %d of %d \226\128\148 %s", done_steps + 1, #job.plans,
+                                job.plans[done_steps + 1].name) end
+    pcall(function() ui.track:set_text(label) end)
+    pcall(function() ui.bar:set_text(string.format("%s  %d%%", progress_bar(fraction), math.floor(fraction * 100))) end)
+    local elapsed = now() - job.t0
+    local eta = ""
+    if done_steps > 0 then
+        eta = string.format("Elapsed %s \226\128\148 about %s left", format_time(elapsed),
+                            format_time(elapsed / done_steps * (total - done_steps)))
+    else
+        eta = "Elapsed " .. format_time(elapsed)
     end
+    pcall(function() ui.eta:set_text(eta) end)
+    pcall(function() dlg:update() end)
 end
 
---- Advance the merge. Called from VLC's listener callbacks, and must return
---- promptly: while this thread is busy, Qt cannot paint the dialog.
-local function tick()
-    if not job or job.state ~= "running" then return end
+on_refresh = function() refresh() end
 
-    if is_playing() then
-        job.started = true
-        job.misses = 0
-
-        local item = vlc.input.item()
-        local name = (item and item:name()) or "?"
-
-        -- Look the current track up in the snapshot rather than counting
-        -- change events. Counting over-reported badly: transient inputs at
-        -- startup each looked like a new track, and a track's name changes
-        -- part-way through when its ID3 title replaces the playlist's.
-        local ok, uri = pcall(function() return item and item:uri() end)
-        local key = ok and uri and (to_path(uri) or uri) or nil
-        if key then
-            for index, track in ipairs(job.tracks) do
-                if track.key == key then
-                    job.matched = true
-                    if index ~= job.index then
-                        job.index = index
-                        log(string.format("track %d/%d: %s", index, #job.tracks, name))
-                    end
-                    break
-                end
-            end
-        end
-
-        job.name = name
-        update_progress()
-        return
+on_cancel_merge = function()
+    if not job then return vlc.deactivate() end
+    log("cancelled by the user")
+    write_file(job_file("cancel.flag"), "1")
+    if not IS_WINDOWS then
+        -- The job's scripts and ffmpeg commands all mention the job directory.
+        os.execute("pkill -f " .. quote(escape_pattern(job.dir)) .. " >/dev/null 2>&1")
+        write_file(job_file("status.txt"), "cancelled\n")
+        delete_file(job.output .. ".partial.mp4")
+    else
+        pcall(function() ui.track:set_text("Stopping after the current clip\226\128\166") end)
+        pcall(function() dlg:update() end)
+        return          -- the script notices cancel.flag and stops by itself
     end
-
-    if not job.started then
-        job.misses = (job.misses or 0) + 1
-        if job.misses > 40 then
-            log("playback never started")
-            finish_merge("never started")
-        end
-        return
-    end
-
-    -- Playback also drops out briefly between tracks, so only a stopped
-    -- playlist means the run is over.
-    if playlist_stopped() then finish_merge("end of playlist") end
+    refresh()
 end
 
-local function start_merge()
-    if job then return end
-    if not pending then return end
-
-    local source, output = pending.source, pending.output
-    local bitrate = pending.bitrate
+start_merge = function()
+    if job or not pending then return end
+    local p = pending
     pending = nil
 
-    show_progress_page(source.label, output)
-    delete_file(output)
+    show_progress_page(p.source.label, p.output)
+    delete_file(p.output)
 
-    local node_id = add_conversion_item(source.path, build_sout(output, bitrate))
-    if not node_id then
-        return show_result("Could not start",
-            "VLC would not accept the playlist for conversion.")
+    local items, skipped = load_items(p.source)
+    if not items or #items == 0 then
+        return show_message("Nothing to merge", "The playlist has no usable entries.")
     end
 
-    local tracks, total_seconds = await_expansion(node_id)
-    if not tracks then
-        pcall(function() vlc.playlist.delete(node_id) end)
-        return show_result("Could not read the playlist",
-            "VLC did not expand " .. source.label .. " into tracks.")
+    local plans = {}
+    for _, item in ipairs(items) do
+        local plan, why = plan_item(p.ffmpeg, item, p)
+        if plan then plans[#plans + 1] = plan
+        else skipped = skipped + 1; log("skipped " .. item.path .. ": " .. tostring(why)) end
+    end
+    if #plans == 0 then
+        return show_message("Nothing to merge", "None of the playlist's entries could be read.")
     end
 
-    job = {
-        state = "running",
-        node_id = node_id,
-        tracks = tracks,
-        total_seconds = total_seconds,
-        output = output,
-        expected_bytes = (bitrate * 1000 / 8) * total_seconds,
-        index = 0,
-        matched = false,
-        misses = 0,
-        started = false,
-        t0 = now(),
-    }
-    log(string.format("merging %d tracks, %s of audio, into %s at %dk",
-        #tracks, format_time(total_seconds), output, bitrate))
+    local base = (function()
+        local ok, dir = pcall(function() return vlc.config.cachedir() end)
+        return (ok and dir and dir ~= "") and dir or dirname(p.output)
+    end)()
+    local dir = base .. SEP .. "merge_video_job"
+    pcall(vlc.io.mkdir, dir, "0700")
+    cleanup_job_dir(dir)
+    delete_file(dir .. SEP .. "log.txt")
 
-    vlc.playlist.gotoitem(tracks[1].id)
-    sleep(0.3)
-    vlc.playlist.play()
-    update_progress()
-    -- Return now: the listener callbacks drive the rest, and the dialog can
-    -- only be painted while this thread is idle.
+    p.dir = dir
+    local script, list, total = build_script(p.ffmpeg, plans, p)
+    local script_path = dir .. SEP .. (IS_WINDOWS and "job.bat" or "job.sh")
+    local ok1 = write_file(script_path, script)
+    local ok2 = write_file(dir .. SEP .. "list.txt", list)
+    if not (ok1 and ok2) then
+        return show_message("Could not start", "Could not write the working files in " .. dir)
+    end
+    write_file(dir .. SEP .. "status.txt", "running\n")
+    write_file(dir .. SEP .. "progress.txt", "0\n")
+
+    job = { dir = dir, plans = plans, total = total, output = p.output, skipped = skipped,
+            t0 = now(), finished = false }
+    log(string.format("merging %d clips into %s", #plans, p.output))
+
+    if IS_WINDOWS then
+        os.execute('start "" /B ' .. quote(script_path))
+    else
+        os.execute("sh " .. quote(script_path) .. " >/dev/null 2>&1 &")
+    end
+    refresh()
 end
 
 on_convert = function()
     if job then return end
-
     local source = sources[tonumber(value_of(ui.src))]
+    local file = (ui.file:get_text() or ""):gsub("^%s+", ""):gsub("%s+$", "")
+    if file ~= "" then
+        if file_size(file) == 0 then
+            return show_message("Playlist file not found", "Could not open <b>" .. file .. "</b>.")
+        end
+        source = { kind = "m3u", path = file, label = basename(file) }
+    end
     local output = ui.out:get_text()
-    local bitrate = tonumber(value_of(ui.rate)) or DEFAULT_BITRATE
+    local size = SIZES[tonumber(value_of(ui.size))] or SIZES[1]
+    local quality = QUALITIES[tonumber(value_of(ui.quality))] or QUALITIES[1]
+    local image_seconds = tonumber(ui.secs:get_text())
+    local ffmpeg = ui.ffmpeg:get_text()
 
-    if not source then
-        return show_result("Nothing to merge", "Could not resolve the selected playlist.")
+    if not source then return show_message("Nothing to merge", "Could not resolve the selected playlist.") end
+    if not output or output == "" then return show_message("No output file", "Please choose where to save the video.") end
+    if not image_seconds or image_seconds <= 0 then
+        return show_message("Seconds per image", "Please enter a number greater than zero.")
     end
-    if not output or output == "" then
-        return show_result("No output file", "Please choose where to save the merged file.")
+    if not ffmpeg_works(ffmpeg) then
+        return show_message("ffmpeg not found", "Could not run <b>" .. tostring(ffmpeg) .. "</b>.<br><br>"
+            .. "Install ffmpeg (ffmpeg.org) or type its full path on the previous page.")
     end
+    if extension(output) ~= "mp4" then output = output .. ".mp4" end
 
-    pending = { source = source, output = output, bitrate = bitrate }
+    pending = { source = source, output = output, w = size.w, h = size.h, crf = quality.crf,
+                image_seconds = image_seconds, ffmpeg = ffmpeg }
     if file_size(output) > 0 then return confirm_overwrite(output) end
     return start_merge()
-end
-
-on_confirm_overwrite = function()
-    return start_merge()
-end
-
-on_cancel_merge = function()
-    -- Once the merge is over this button has been relabelled "Close", so it
-    -- must close rather than bounce the user back to the setup prompt.
-    if not job then return vlc.deactivate() end
-
-    -- Escape hatch: if every track has already been converted and playback has
-    -- stopped, the end-of-playlist event simply never reached us. Finish the
-    -- file rather than throwing away a complete merge.
-    if not is_playing() and job.matched and job.index >= #job.tracks then
-        log("finishing on request; the end-of-playlist event never arrived")
-        return finish_merge("end of playlist")
-    end
-
-    log("cancelled by the user")
-    pcall(vlc.playlist.stop)
-    sleep(0.5)
-    finish_merge("cancelled")
 end
 
 --=============================================================================
@@ -676,40 +835,36 @@ end
 
 function descriptor()
     return {
-        title = "Merge Playlist into one File",
-        version = "1.0",
+        title = "Merge Playlist into one Video",
+        version = "2.0",
         author = "",
-        shortdesc = "Merge Playlist into one File",
-        description = "Joins every track of a playlist into a single M4A audio "
-                   .. "file, keeping each track's start/stop times.",
-        -- These listeners are the extension's only clock: there is no timer in
-        -- the Lua API, so the merge is advanced by playback events.
+        shortdesc = "Merge Playlist into one Video",
+        description = "Joins the videos, images and audio files of a playlist, in order, "
+                   .. "into a single MP4. Needs ffmpeg.",
+        -- Playback events are the only clock available, so they refresh the progress page.
         capabilities = { "input-listener", "playing-listener", "meta-listener" },
     }
 end
 
-function activate()
-    pcall(probe_sandbox)
-    show_setup()
-end
+function activate() show_setup() end
 
 function deactivate()
-    if job then pcall(on_cancel_merge) end
     if dlg then pcall(function() dlg:hide() end) end
 end
 
-function close()
-    vlc.deactivate()
-end
+function close() vlc.deactivate() end
 
---- Listener errors are only logged. Rebuilding the dialog from here is what
---- deadlocked VLC: an error in one callback triggered a dialog rebuild, and
---- dlg:delete() never returned.
 local function on_event(name)
-    local ok, err = pcall(tick)
+    local ok, err = pcall(refresh)
     if not ok then log("!! " .. name .. ": " .. tostring(err)) end
 end
 
 function input_changed() on_event("input_changed") end
 function playing_changed() on_event("playing_changed") end
 function meta_changed() on_event("meta_changed") end
+
+-- Test hook: lets test harnesses reach the pure parts. Never set inside VLC.
+if MERGE_PLAYLIST_TEST then
+    return { read_m3u = read_m3u, plan_item = plan_item, build_script = build_script,
+             find_ffmpeg = find_ffmpeg, probe = probe, quote = quote }
+end
